@@ -1,18 +1,28 @@
-// server.js - Main Express Server File
+// server-with-jwt-updated.js
+// Backend with JWT Authentication
+
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const { Pool } = require('pg');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
+const PORT = process.env.PORT || 5000;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Database Connection
+// Database Connection with SSL for Neon
 const pool = new Pool({
   user: process.env.DB_USER || 'postgres',
   password: process.env.DB_PASSWORD || 'password',
@@ -22,28 +32,123 @@ const pool = new Pool({
   ssl: process.env.DB_HOST && process.env.DB_HOST.includes('neon') ? { rejectUnauthorized: false } : false
 });
 
-pool.on('error', (err) => {
-  console.error('Unexpected error on idle client', err);
-  process.exit(-1);
-});
-
 // Test database connection
-pool.query('SELECT NOW()', (err, res) => {
-  if (err) {
-    console.error('Database connection error:', err);
-  } else {
-    console.log('✓ Database connected successfully');
-  }
+pool.on('connect', () => {
+  console.log('✓ Database connected successfully');
 });
 
-// ==================== INTERNS ENDPOINTS ====================
+pool.on('error', (err) => {
+  console.error('✗ Unexpected error on idle client', err);
+});
 
-// GET all interns
-app.get('/api/interns', async (req, res) => {
+// ============================================================================
+// JWT Authentication Middleware
+// ============================================================================
+
+const verifyToken = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      message: 'No token provided. Please login first.'
+    });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET || 'your_secret_key', (err, decoded) => {
+    if (err) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid or expired token. Please login again.'
+      });
+    }
+    req.user = decoded;
+    next();
+  });
+};
+
+// ============================================================================
+// Authentication Routes
+// ============================================================================
+
+// Login Route
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body;
+
+  // Validate input
+  if (!username || !password) {
+    return res.status(400).json({
+      success: false,
+      message: 'Username and password are required'
+    });
+  }
+
+  // Hardcoded credentials (for demo - in production use database)
+  const validUsers = {
+    'admin': { password: 'admin123', role: 'admin', name: 'Administrator' },
+    'manager': { password: 'manager123', role: 'manager', name: 'Manager' },
+    'intern': { password: 'intern123', role: 'intern', name: 'Intern' }
+  };
+
+  const user = validUsers[username];
+
+  if (!user || user.password !== password) {
+    return res.status(401).json({
+      success: false,
+      message: 'Invalid username or password'
+    });
+  }
+
+  // Generate JWT Token
+  const token = jwt.sign(
+    {
+      username: username,
+      role: user.role,
+      name: user.name
+    },
+    process.env.JWT_SECRET || 'your_secret_key',
+    { expiresIn: '24h' }
+  );
+
+  res.json({
+    success: true,
+    token: token,
+    user: {
+      username: username,
+      role: user.role,
+      name: user.name
+    },
+    message: 'Login successful',
+    expiresIn: '24h'
+  });
+});
+
+// Verify Token Route
+app.post('/api/auth/verify', verifyToken, (req, res) => {
+  res.json({
+    success: true,
+    user: req.user,
+    message: 'Token is valid'
+  });
+});
+
+// Logout Route
+app.post('/api/auth/logout', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Logged out successfully. Token removed from client-side.'
+  });
+});
+
+// ============================================================================
+// Protected Routes - Get Interns
+// ============================================================================
+
+app.get('/api/interns', verifyToken, async (req, res) => {
   try {
-    const query = 'SELECT * FROM interns ORDER BY created_at DESC';
-    const result = await pool.query(query);
-    res.status(200).json({
+    const result = await pool.query('SELECT * FROM interns ORDER BY id DESC');
+    res.json({
       success: true,
       data: result.rows,
       message: 'Interns retrieved successfully'
@@ -52,27 +157,16 @@ app.get('/api/interns', async (req, res) => {
     console.error('Error fetching interns:', error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching interns',
-      error: error.message
+      error: error.message,
+      message: 'Error fetching interns'
     });
   }
 });
 
-// GET single intern by ID
-app.get('/api/interns/:id', async (req, res) => {
+app.get('/api/interns/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
-
-    // Validate ID
-    if (!id || isNaN(id)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid intern ID'
-      });
-    }
-
-    const query = 'SELECT * FROM interns WHERE id = $1';
-    const result = await pool.query(query, [id]);
+    const result = await pool.query('SELECT * FROM interns WHERE id = $1', [id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({
@@ -81,7 +175,7 @@ app.get('/api/interns/:id', async (req, res) => {
       });
     }
 
-    res.status(200).json({
+    res.json({
       success: true,
       data: result.rows[0],
       message: 'Intern retrieved successfully'
@@ -90,50 +184,31 @@ app.get('/api/interns/:id', async (req, res) => {
     console.error('Error fetching intern:', error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching intern',
-      error: error.message
+      error: error.message,
+      message: 'Error fetching intern'
     });
   }
 });
 
-// POST create new intern
-app.post('/api/interns', async (req, res) => {
+// ============================================================================
+// Protected Routes - Create Intern
+// ============================================================================
+
+app.post('/api/interns', verifyToken, async (req, res) => {
   try {
     const { name, email, department, joining_date } = req.body;
 
-    // Validation
     if (!name || !email || !department || !joining_date) {
       return res.status(400).json({
         success: false,
-        message: 'All fields are required: name, email, department, joining_date'
+        message: 'All fields are required'
       });
     }
 
-    // Email validation
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid email format'
-      });
-    }
-
-    // Check if email already exists
-    const checkEmail = await pool.query('SELECT id FROM interns WHERE email = $1', [email]);
-    if (checkEmail.rows.length > 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'Email already exists'
-      });
-    }
-
-    // Insert intern
-    const query = `
-      INSERT INTO interns (name, email, department, joining_date, created_at)
-      VALUES ($1, $2, $3, $4, NOW())
-      RETURNING *
-    `;
-    const result = await pool.query(query, [name, email, department, joining_date]);
+    const result = await pool.query(
+      'INSERT INTO interns (name, email, department, joining_date, created_at, updated_at) VALUES ($1, $2, $3, $4, NOW(), NOW()) RETURNING *',
+      [name, email, department, joining_date]
+    );
 
     res.status(201).json({
       success: true,
@@ -142,76 +217,42 @@ app.post('/api/interns', async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating intern:', error);
+    if (error.code === '23505') {
+      return res.status(400).json({
+        success: false,
+        message: 'Email already exists'
+      });
+    }
     res.status(500).json({
       success: false,
-      message: 'Error creating intern',
-      error: error.message
+      error: error.message,
+      message: 'Error creating intern'
     });
   }
 });
 
-// PUT update intern
-app.put('/api/interns/:id', async (req, res) => {
+// ============================================================================
+// Protected Routes - Update Intern
+// ============================================================================
+
+app.put('/api/interns/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { name, email, department, joining_date } = req.body;
 
-    // Validate ID
-    if (!id || isNaN(id)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid intern ID'
-      });
-    }
+    const result = await pool.query(
+      'UPDATE interns SET name = $1, email = $2, department = $3, joining_date = $4, updated_at = NOW() WHERE id = $5 RETURNING *',
+      [name, email, department, joining_date, id]
+    );
 
-    // Validation
-    if (!name || !email || !department || !joining_date) {
-      return res.status(400).json({
-        success: false,
-        message: 'All fields are required: name, email, department, joining_date'
-      });
-    }
-
-    // Email validation
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid email format'
-      });
-    }
-
-    // Check if intern exists
-    const checkIntern = await pool.query('SELECT id FROM interns WHERE id = $1', [id]);
-    if (checkIntern.rows.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Intern not found'
       });
     }
 
-    // Check if email already exists (for other interns)
-    const checkEmail = await pool.query(
-      'SELECT id FROM interns WHERE email = $1 AND id != $2',
-      [email, id]
-    );
-    if (checkEmail.rows.length > 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'Email already exists'
-      });
-    }
-
-    // Update intern
-    const query = `
-      UPDATE interns
-      SET name = $1, email = $2, department = $3, joining_date = $4
-      WHERE id = $5
-      RETURNING *
-    `;
-    const result = await pool.query(query, [name, email, department, joining_date, id]);
-
-    res.status(200).json({
+    res.json({
       success: true,
       data: result.rows[0],
       message: 'Intern updated successfully'
@@ -220,42 +261,30 @@ app.put('/api/interns/:id', async (req, res) => {
     console.error('Error updating intern:', error);
     res.status(500).json({
       success: false,
-      message: 'Error updating intern',
-      error: error.message
+      error: error.message,
+      message: 'Error updating intern'
     });
   }
 });
 
-// DELETE intern
-app.delete('/api/interns/:id', async (req, res) => {
+// ============================================================================
+// Protected Routes - Delete Intern
+// ============================================================================
+
+app.delete('/api/interns/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Validate ID
-    if (!id || isNaN(id)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid intern ID'
-      });
-    }
+    const result = await pool.query('DELETE FROM interns WHERE id = $1 RETURNING *', [id]);
 
-    // Check if intern exists
-    const checkIntern = await pool.query('SELECT id FROM interns WHERE id = $1', [id]);
-    if (checkIntern.rows.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Intern not found'
       });
     }
 
-    // Delete associated tasks first
-    await pool.query('DELETE FROM tasks WHERE intern_id = $1', [id]);
-
-    // Delete intern
-    const query = 'DELETE FROM interns WHERE id = $1 RETURNING *';
-    const result = await pool.query(query, [id]);
-
-    res.status(200).json({
+    res.json({
       success: true,
       data: result.rows[0],
       message: 'Intern deleted successfully'
@@ -264,20 +293,25 @@ app.delete('/api/interns/:id', async (req, res) => {
     console.error('Error deleting intern:', error);
     res.status(500).json({
       success: false,
-      message: 'Error deleting intern',
-      error: error.message
+      error: error.message,
+      message: 'Error deleting intern'
     });
   }
 });
 
-// ==================== TASKS ENDPOINTS ====================
+// ============================================================================
+// Protected Routes - Get Tasks
+// ============================================================================
 
-// GET all tasks
-app.get('/api/tasks', async (req, res) => {
+app.get('/api/tasks', verifyToken, async (req, res) => {
   try {
-    const query = 'SELECT * FROM tasks ORDER BY created_at DESC';
-    const result = await pool.query(query);
-    res.status(200).json({
+    const result = await pool.query(`
+      SELECT t.*, i.name as intern_name 
+      FROM tasks t 
+      LEFT JOIN interns i ON t.intern_id = i.id 
+      ORDER BY t.id DESC
+    `);
+    res.json({
       success: true,
       data: result.rows,
       message: 'Tasks retrieved successfully'
@@ -286,28 +320,49 @@ app.get('/api/tasks', async (req, res) => {
     console.error('Error fetching tasks:', error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching tasks',
-      error: error.message
+      error: error.message,
+      message: 'Error fetching tasks'
     });
   }
 });
 
-// GET tasks by intern
-app.get('/api/interns/:id/tasks', async (req, res) => {
+app.get('/api/tasks/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
+    const result = await pool.query(`
+      SELECT t.*, i.name as intern_name 
+      FROM tasks t 
+      LEFT JOIN interns i ON t.intern_id = i.id 
+      WHERE t.id = $1
+    `, [id]);
 
-    if (!id || isNaN(id)) {
-      return res.status(400).json({
+    if (result.rows.length === 0) {
+      return res.status(404).json({
         success: false,
-        message: 'Invalid intern ID'
+        message: 'Task not found'
       });
     }
 
-    const query = 'SELECT * FROM tasks WHERE intern_id = $1 ORDER BY created_at DESC';
-    const result = await pool.query(query, [id]);
+    res.json({
+      success: true,
+      data: result.rows[0],
+      message: 'Task retrieved successfully'
+    });
+  } catch (error) {
+    console.error('Error fetching task:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: 'Error fetching task'
+    });
+  }
+});
 
-    res.status(200).json({
+app.get('/api/interns/:id/tasks', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('SELECT * FROM tasks WHERE intern_id = $1 ORDER BY id DESC', [id]);
+    res.json({
       success: true,
       data: result.rows,
       message: 'Tasks retrieved successfully'
@@ -316,51 +371,31 @@ app.get('/api/interns/:id/tasks', async (req, res) => {
     console.error('Error fetching tasks:', error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching tasks',
-      error: error.message
+      error: error.message,
+      message: 'Error fetching tasks'
     });
   }
 });
 
-// POST create task
-app.post('/api/tasks', async (req, res) => {
+// ============================================================================
+// Protected Routes - Create Task
+// ============================================================================
+
+app.post('/api/tasks', verifyToken, async (req, res) => {
   try {
     const { intern_id, title, description, status } = req.body;
 
-    // Validation
     if (!intern_id || !title || !description) {
       return res.status(400).json({
         success: false,
-        message: 'All fields are required: intern_id, title, description'
+        message: 'All fields are required'
       });
     }
 
-    // Validate status
-    const validStatuses = ['pending', 'in_progress', 'completed'];
-    const taskStatus = status || 'pending';
-    if (!validStatuses.includes(taskStatus)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid status. Must be: pending, in_progress, or completed'
-      });
-    }
-
-    // Check if intern exists
-    const checkIntern = await pool.query('SELECT id FROM interns WHERE id = $1', [intern_id]);
-    if (checkIntern.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Intern not found'
-      });
-    }
-
-    // Insert task
-    const query = `
-      INSERT INTO tasks (intern_id, title, description, status, created_at)
-      VALUES ($1, $2, $3, $4, NOW())
-      RETURNING *
-    `;
-    const result = await pool.query(query, [intern_id, title, description, taskStatus]);
+    const result = await pool.query(
+      'INSERT INTO tasks (intern_id, title, description, status, created_at, updated_at) VALUES ($1, $2, $3, $4, NOW(), NOW()) RETURNING *',
+      [intern_id, title, description, status || 'pending']
+    );
 
     res.status(201).json({
       success: true,
@@ -371,26 +406,25 @@ app.post('/api/tasks', async (req, res) => {
     console.error('Error creating task:', error);
     res.status(500).json({
       success: false,
-      message: 'Error creating task',
-      error: error.message
+      error: error.message,
+      message: 'Error creating task'
     });
   }
 });
 
-// GET single task
-app.get('/api/tasks/:id', async (req, res) => {
+// ============================================================================
+// Protected Routes - Update Task
+// ============================================================================
+
+app.put('/api/tasks/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
+    const { intern_id, title, description, status } = req.body;
 
-    if (!id || isNaN(id)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid task ID'
-      });
-    }
-
-    const query = 'SELECT * FROM tasks WHERE id = $1';
-    const result = await pool.query(query, [id]);
+    const result = await pool.query(
+      'UPDATE tasks SET intern_id = $1, title = $2, description = $3, status = $4, updated_at = NOW() WHERE id = $5 RETURNING *',
+      [intern_id, title, description, status, id]
+    );
 
     if (result.rows.length === 0) {
       return res.status(404).json({
@@ -399,69 +433,7 @@ app.get('/api/tasks/:id', async (req, res) => {
       });
     }
 
-    res.status(200).json({
-      success: true,
-      data: result.rows[0],
-      message: 'Task retrieved successfully'
-    });
-  } catch (error) {
-    console.error('Error fetching task:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching task',
-      error: error.message
-    });
-  }
-});
-
-// PUT update task
-app.put('/api/tasks/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { title, description, status } = req.body;
-
-    // Validate ID
-    if (!id || isNaN(id)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid task ID'
-      });
-    }
-
-    // Check if task exists
-    const checkTask = await pool.query('SELECT * FROM tasks WHERE id = $1', [id]);
-    if (checkTask.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Task not found'
-      });
-    }
-
-    // Validate status if provided
-    if (status) {
-      const validStatuses = ['pending', 'in_progress', 'completed'];
-      if (!validStatuses.includes(status)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid status. Must be: pending, in_progress, or completed'
-        });
-      }
-    }
-
-    // Update task
-    const taskTitle = title || checkTask.rows[0].title;
-    const taskDescription = description || checkTask.rows[0].description;
-    const taskStatus = status || checkTask.rows[0].status;
-
-    const query = `
-      UPDATE tasks
-      SET title = $1, description = $2, status = $3
-      WHERE id = $4
-      RETURNING *
-    `;
-    const result = await pool.query(query, [taskTitle, taskDescription, taskStatus, id]);
-
-    res.status(200).json({
+    res.json({
       success: true,
       data: result.rows[0],
       message: 'Task updated successfully'
@@ -470,39 +442,30 @@ app.put('/api/tasks/:id', async (req, res) => {
     console.error('Error updating task:', error);
     res.status(500).json({
       success: false,
-      message: 'Error updating task',
-      error: error.message
+      error: error.message,
+      message: 'Error updating task'
     });
   }
 });
 
-// DELETE task
-app.delete('/api/tasks/:id', async (req, res) => {
+// ============================================================================
+// Protected Routes - Delete Task
+// ============================================================================
+
+app.delete('/api/tasks/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Validate ID
-    if (!id || isNaN(id)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid task ID'
-      });
-    }
+    const result = await pool.query('DELETE FROM tasks WHERE id = $1 RETURNING *', [id]);
 
-    // Check if task exists
-    const checkTask = await pool.query('SELECT id FROM tasks WHERE id = $1', [id]);
-    if (checkTask.rows.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Task not found'
       });
     }
 
-    // Delete task
-    const query = 'DELETE FROM tasks WHERE id = $1 RETURNING *';
-    const result = await pool.query(query, [id]);
-
-    res.status(200).json({
+    res.json({
       success: true,
       data: result.rows[0],
       message: 'Task deleted successfully'
@@ -511,23 +474,24 @@ app.delete('/api/tasks/:id', async (req, res) => {
     console.error('Error deleting task:', error);
     res.status(500).json({
       success: false,
-      message: 'Error deleting task',
-      error: error.message
+      error: error.message,
+      message: 'Error deleting task'
     });
   }
 });
 
-// ==================== STATISTICS ENDPOINT ====================
+// ============================================================================
+// Protected Routes - Statistics
+// ============================================================================
 
-// GET dashboard statistics
-app.get('/api/statistics', async (req, res) => {
+app.get('/api/statistics', verifyToken, async (req, res) => {
   try {
-    const totalInterns = await pool.query('SELECT COUNT(*) as count FROM interns');
-    const totalTasks = await pool.query('SELECT COUNT(*) as count FROM tasks');
-    const completedTasks = await pool.query("SELECT COUNT(*) as count FROM tasks WHERE status = 'completed'");
-    const pendingTasks = await pool.query("SELECT COUNT(*) as count FROM tasks WHERE status = 'pending'");
+    const totalInterns = await pool.query('SELECT COUNT(*) FROM interns');
+    const totalTasks = await pool.query('SELECT COUNT(*) FROM tasks');
+    const completedTasks = await pool.query("SELECT COUNT(*) FROM tasks WHERE status = 'completed'");
+    const pendingTasks = await pool.query("SELECT COUNT(*) FROM tasks WHERE status = 'pending'");
 
-    res.status(200).json({
+    res.json({
       success: true,
       data: {
         totalInterns: parseInt(totalInterns.rows[0].count),
@@ -541,64 +505,25 @@ app.get('/api/statistics', async (req, res) => {
     console.error('Error fetching statistics:', error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching statistics',
-      error: error.message
+      error: error.message,
+      message: 'Error fetching statistics'
     });
   }
 });
 
-// ==================== ERROR HANDLING ====================
+// ============================================================================
+// Start Server
+// ============================================================================
 
-// 404 Not Found
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    message: 'Route not found',
-    path: req.path
-  });
-});
-
-// General error handler
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({
-    success: false,
-    message: 'Internal server error',
-    error: err.message
-  });
-});
-
-// ==================== SERVER START ====================
-
-const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`
-╔══════════════════════════════════════════════╗
-║   Intern Management Portal - Backend Server  ║
-║             Server Running Successfully      ║
-╚══════════════════════════════════════════════╝
-
-✓ Server is running on http://localhost:${PORT}
-✓ Database: ${process.env.DB_NAME || 'intern_portal'}
-✓ CORS enabled for frontend communication
-
-Available Endpoints:
-  GET    /api/interns              - Get all interns
-  GET    /api/interns/:id          - Get single intern
-  POST   /api/interns              - Create intern
-  PUT    /api/interns/:id          - Update intern
-  DELETE /api/interns/:id          - Delete intern
-  
-  GET    /api/tasks                - Get all tasks
-  GET    /api/tasks/:id            - Get single task
-  GET    /api/interns/:id/tasks    - Get intern's tasks
-  POST   /api/tasks                - Create task
-  PUT    /api/tasks/:id            - Update task
-  DELETE /api/tasks/:id            - Delete task
-  
-  GET    /api/statistics           - Get dashboard stats
-
-  `);
+  console.log(`\n✓ Server running on http://localhost:${PORT}`);
+  console.log(`✓ CORS enabled for: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
+  console.log(`✓ JWT Secret configured: ${process.env.JWT_SECRET ? 'Yes' : 'No (using default)'}`);
+  console.log('\n📝 Login Credentials:');
+  console.log('   Admin:   admin / admin123');
+  console.log('   Manager: manager / manager123');
+  console.log('   Intern:  intern / intern123');
+  console.log('\n');
 });
 
 module.exports = app;
