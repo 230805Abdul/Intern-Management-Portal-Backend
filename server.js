@@ -1,4 +1,3 @@
-// server-with-jwt-updated.js
 // Backend with JWT Authentication
 
 const express = require('express');
@@ -6,6 +5,7 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -41,6 +41,30 @@ pool.on('error', (err) => {
   console.error('✗ Unexpected error on idle client', err);
 });
 
+// Ensure the attendance table exists (keeps setup self-contained, like the
+// rest of this demo backend which assumes interns/tasks tables already exist)
+const ensureAttendanceTable = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS attendance (
+        id SERIAL PRIMARY KEY,
+        intern_id INTEGER NOT NULL REFERENCES interns(id) ON DELETE CASCADE,
+        date DATE NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'present',
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(intern_id, date)
+      )
+    `);
+    console.log('✓ Attendance table ready');
+  } catch (error) {
+    console.error('✗ Could not create attendance table:', error.message);
+  }
+};
+
+ensureAttendanceTable();
+
 // ============================================================================
 // JWT Authentication Middleware
 // ============================================================================
@@ -69,8 +93,97 @@ const verifyToken = (req, res, next) => {
 };
 
 // ============================================================================
+// User Store (in-memory) + Password Hashing
+// ============================================================================
+// NOTE: Replace this with a real `users` database table in production.
+// This keeps the original demo accounts working AND allows anyone to sign up
+// with their own username/password.
+
+const hashPassword = (password, salt = crypto.randomBytes(16).toString('hex')) => {
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+};
+
+const verifyPassword = (password, stored) => {
+  const [salt, hash] = stored.split(':');
+  const candidateHash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return candidateHash === hash;
+};
+
+// username -> { passwordHash, role, name }
+const users = new Map();
+
+// Keep the original demo accounts working
+users.set('admin', { passwordHash: hashPassword('admin123'), role: 'admin', name: 'Administrator' });
+users.set('manager', { passwordHash: hashPassword('manager123'), role: 'manager', name: 'Manager' });
+users.set('intern', { passwordHash: hashPassword('intern123'), role: 'intern', name: 'Intern' });
+
+// Validation rules shown to the user on the signup form and enforced here
+const USERNAME_RULES = 'Username must be 3-20 characters and contain only letters, numbers, and underscores (must start with a letter).';
+const PASSWORD_RULES = 'Password must be at least 6 characters long.';
+
+const isValidUsername = (username) => /^[a-zA-Z][a-zA-Z0-9_]{2,19}$/.test(username);
+const isValidPassword = (password) => typeof password === 'string' && password.length >= 6;
+
+// ============================================================================
 // Authentication Routes
 // ============================================================================
+
+// Signup Route
+app.post('/api/auth/signup', (req, res) => {
+  const { username, password, name } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({
+      success: false,
+      message: 'Username and password are required'
+    });
+  }
+
+  if (!isValidUsername(username)) {
+    return res.status(400).json({
+      success: false,
+      message: USERNAME_RULES
+    });
+  }
+
+  if (!isValidPassword(password)) {
+    return res.status(400).json({
+      success: false,
+      message: PASSWORD_RULES
+    });
+  }
+
+  if (users.has(username)) {
+    return res.status(400).json({
+      success: false,
+      message: 'That username is already taken. Please choose another or log in.'
+    });
+  }
+
+  const newUser = {
+    passwordHash: hashPassword(password),
+    role: 'intern',
+    name: name && name.trim() ? name.trim() : username
+  };
+
+  users.set(username, newUser);
+
+  // Generate JWT Token so the user is immediately logged in after signup
+  const token = jwt.sign(
+    { username, role: newUser.role, name: newUser.name },
+    process.env.JWT_SECRET || 'your_secret_key',
+    { expiresIn: '24h' }
+  );
+
+  res.status(201).json({
+    success: true,
+    token: token,
+    user: { username, role: newUser.role, name: newUser.name },
+    message: 'Account created successfully',
+    expiresIn: '24h'
+  });
+});
 
 // Login Route
 app.post('/api/auth/login', (req, res) => {
@@ -84,19 +197,12 @@ app.post('/api/auth/login', (req, res) => {
     });
   }
 
-  // Hardcoded credentials (for demo - in production use database)
-  const validUsers = {
-    'admin': { password: 'admin123', role: 'admin', name: 'Administrator' },
-    'manager': { password: 'manager123', role: 'manager', name: 'Manager' },
-    'intern': { password: 'intern123', role: 'intern', name: 'Intern' }
-  };
+  const user = users.get(username);
 
-  const user = validUsers[username];
-
-  if (!user || user.password !== password) {
+  if (!user || !verifyPassword(password, user.passwordHash)) {
     return res.status(401).json({
       success: false,
-      message: 'Invalid username or password'
+      message: 'Invalid username or password. New here? Please sign up first.'
     });
   }
 
@@ -481,6 +587,228 @@ app.delete('/api/tasks/:id', verifyToken, async (req, res) => {
 });
 
 // ============================================================================
+// Protected Routes - Attendance
+// ============================================================================
+
+// Get all attendance records (optionally filter by ?date=YYYY-MM-DD or ?intern_id=)
+app.get('/api/attendance', verifyToken, async (req, res) => {
+  try {
+    const { date, intern_id } = req.query;
+    const conditions = [];
+    const params = [];
+
+    if (date) {
+      params.push(date);
+      conditions.push(`a.date = $${params.length}`);
+    }
+    if (intern_id) {
+      params.push(intern_id);
+      conditions.push(`a.intern_id = $${params.length}`);
+    }
+
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const result = await pool.query(
+      `SELECT a.*, i.name as intern_name, i.department
+       FROM attendance a
+       LEFT JOIN interns i ON a.intern_id = i.id
+       ${whereClause}
+       ORDER BY a.date DESC, a.id DESC`,
+      params
+    );
+
+    res.json({
+      success: true,
+      data: result.rows,
+      message: 'Attendance retrieved successfully'
+    });
+  } catch (error) {
+    console.error('Error fetching attendance:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: 'Error fetching attendance'
+    });
+  }
+});
+
+// Get attendance summary (counts by status, and counts by intern) — used to
+// power the attendance charts on the frontend
+app.get('/api/attendance/summary', verifyToken, async (req, res) => {
+  try {
+    const byStatus = await pool.query(`
+      SELECT status, COUNT(*) as count
+      FROM attendance
+      GROUP BY status
+    `);
+
+    const byIntern = await pool.query(`
+      SELECT
+        i.id as intern_id,
+        i.name as intern_name,
+        COUNT(*) FILTER (WHERE a.status = 'present') as present,
+        COUNT(*) FILTER (WHERE a.status = 'absent') as absent,
+        COUNT(*) FILTER (WHERE a.status = 'late') as late,
+        COUNT(*) FILTER (WHERE a.status = 'leave') as leave
+      FROM attendance a
+      LEFT JOIN interns i ON a.intern_id = i.id
+      GROUP BY i.id, i.name
+      ORDER BY i.name ASC
+    `);
+
+    res.json({
+      success: true,
+      data: {
+        byStatus: byStatus.rows.map(r => ({ status: r.status, count: parseInt(r.count) })),
+        byIntern: byIntern.rows.map(r => ({
+          intern_id: r.intern_id,
+          intern_name: r.intern_name,
+          present: parseInt(r.present),
+          absent: parseInt(r.absent),
+          late: parseInt(r.late),
+          leave: parseInt(r.leave)
+        }))
+      },
+      message: 'Attendance summary retrieved successfully'
+    });
+  } catch (error) {
+    console.error('Error fetching attendance summary:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: 'Error fetching attendance summary'
+    });
+  }
+});
+
+app.get('/api/interns/:id/attendance', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      'SELECT * FROM attendance WHERE intern_id = $1 ORDER BY date DESC',
+      [id]
+    );
+    res.json({
+      success: true,
+      data: result.rows,
+      message: 'Attendance retrieved successfully'
+    });
+  } catch (error) {
+    console.error('Error fetching intern attendance:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: 'Error fetching intern attendance'
+    });
+  }
+});
+
+// Mark/Create attendance
+app.post('/api/attendance', verifyToken, async (req, res) => {
+  try {
+    const { intern_id, date, status, notes } = req.body;
+
+    if (!intern_id || !date || !status) {
+      return res.status(400).json({
+        success: false,
+        message: 'Intern, date, and status are required'
+      });
+    }
+
+    const validStatuses = ['present', 'absent', 'late', 'leave'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Status must be one of: ${validStatuses.join(', ')}`
+      });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO attendance (intern_id, date, status, notes, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, NOW(), NOW())
+       ON CONFLICT (intern_id, date)
+       DO UPDATE SET status = EXCLUDED.status, notes = EXCLUDED.notes, updated_at = NOW()
+       RETURNING *`,
+      [intern_id, date, status, notes || null]
+    );
+
+    res.status(201).json({
+      success: true,
+      data: result.rows[0],
+      message: 'Attendance recorded successfully'
+    });
+  } catch (error) {
+    console.error('Error recording attendance:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: 'Error recording attendance'
+    });
+  }
+});
+
+// Update attendance
+app.put('/api/attendance/:id', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, notes } = req.body;
+
+    const result = await pool.query(
+      'UPDATE attendance SET status = $1, notes = $2, updated_at = NOW() WHERE id = $3 RETURNING *',
+      [status, notes || null, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Attendance record not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: result.rows[0],
+      message: 'Attendance updated successfully'
+    });
+  } catch (error) {
+    console.error('Error updating attendance:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: 'Error updating attendance'
+    });
+  }
+});
+
+// Delete attendance
+app.delete('/api/attendance/:id', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('DELETE FROM attendance WHERE id = $1 RETURNING *', [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Attendance record not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: result.rows[0],
+      message: 'Attendance deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting attendance:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: 'Error deleting attendance'
+    });
+  }
+});
+
+// ============================================================================
 // Protected Routes - Statistics
 // ============================================================================
 
@@ -519,7 +847,7 @@ app.listen(PORT, () => {
   console.log(`\n✓ Server running on http://localhost:${PORT}`);
   console.log(`✓ CORS enabled for: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
   console.log(`✓ JWT Secret configured: ${process.env.JWT_SECRET ? 'Yes' : 'No (using default)'}`);
-  console.log('\n📝 Login Credentials:');
+  console.log('\n📝 Demo Login Credentials (or sign up with your own):');
   console.log('   Admin:   admin / admin123');
   console.log('   Manager: manager / manager123');
   console.log('   Intern:  intern / intern123');
